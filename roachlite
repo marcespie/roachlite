@@ -1,0 +1,113 @@
+#! /usr/bin/perl
+# $OpenBSD$
+#
+# Copyright (c) 2019 Marc Espie <espie@openbsd.org>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+use strict;
+use warnings;
+use DBI;
+use FindBin;
+use lib $FindBin::Bin;
+
+package RoachLite;
+
+sub new
+{
+	my ($class, $dbname, $sqlports) = @_;
+	my $o =bless {db => $class->connect($dbname, $sqlports)}, $class;
+	$o->update_schema;
+	$o->synch_sqlports;
+	return $o;
+}
+
+sub connect
+{
+	my ($class, $dbname, $sqlports) = @_;
+	my $db = DBI->connect("dbi:SQLite:dbname=$dbname", '', '', 
+	    {AutoCommit => 0});
+	$db->do("ATTACH DATABASE '$sqlports' as sqlports");
+	return $db;
+}
+
+sub db
+{
+	return shift->{db};
+}
+
+sub do
+{
+	return shift->db->do(@_);
+}
+
+sub prepare
+{
+	return shift->db->prepare(@_);
+}
+
+sub commit
+{
+	return shift->db->commit;
+}
+
+sub disconnect
+{
+	return shift->db->disconnect;
+}
+
+sub update_schema
+{
+	my $self = shift;
+	$self->do(qq{
+CREATE TABLE IF NOT EXISTS 
+    PkgPath (Id Integer Primary Key, Path Text NOT NULL UNIQUE, SqlPortsId integer)});
+}
+
+sub synch_sqlports
+{
+	my $self = shift;
+	# first statement grabs relevant index data from sqlports
+	my $stmt = $self->prepare(qq{
+	SELECT DISTINCT sqlports._paths.pkgpath,p1.fullpkgpath 
+	FROM sqlports._paths 
+	    JOIN sqlports._paths p1 ON p1.id=_paths.pkgpath});
+
+	# second statement creates it in RoachLite, OR updates the index 
+	# to point to the correct line in sqlports
+	my $stmt2 = $self->prepare(qq{
+	INSERT INTO PkgPath (SqlPortsId, Path) VALUES (?, ?)
+	ON CONFLICT (Path) DO UPDATE SET SqlPortsId=Excluded.SqlPortsId});
+
+	# ... and third statement kills indices for obsoleted ports (put the index
+	# at -1, to possibly be gc'd later)
+
+	my $stmt3 = $self->prepare(qq{
+	UPDATE PkgPath SET SqlPortsId=-1 
+	WHERE Path NOT IN (select fullpkgpath from sqlports._paths)});
+
+	$stmt->execute;
+	while (my @l = $stmt->fetchrow_array) {
+		$stmt2->execute(@l);
+	}
+	$stmt3->execute;
+	$self->commit;
+}
+
+package main;
+
+my $dbname = 'roachlite.db';
+my $sqlports = '/usr/local/share/sqlports';
+
+my $db = RoachLite->new($dbname, $sqlports);
+
+$db->disconnect;
